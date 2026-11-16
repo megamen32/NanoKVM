@@ -1353,6 +1353,7 @@ void* vi_subsystem_detection(void * arg)
                         break;
                     case 1:
                         debug("[kvmv] HDMI and CSI status are normal\n");
+                        kvmv_cfg.hdmi_res_err = NORMAL_RES;
                         kvmv_cfg.vi_detect_state = 2;
                         break;
                     case 2:
@@ -1431,9 +1432,12 @@ int kvmv_read_img(uint16_t width, uint16_t height, uint8_t type,
     if (type > VENC_H264) return IMG_VENC_ERROR;
     std::lock_guard<std::mutex> lock(capture_mutex[type]);
     if (kvmv_cfg.try_exit_thread || kvmv_cfg.hdmi_stop_flag) return IMG_NOT_EXIST;
-    if (kvmv_cfg.hdmi_res_err == ERROR_RES) return -7;
     if (kvmv_cfg.hdmi_res_type == UNSUPPORT_RES) return -6;
-    if (kvmv_cfg.vi_detect_state == 1) return -4;
+    // Let the existing codec path warm the VI -> VPSS -> VENC pipeline while
+    // the detector is validating a resolution. The frame must never escape
+    // during either the pre-acquire or post-acquire pending/error snapshot.
+    const bool error_before = kvmv_cfg.hdmi_res_err == ERROR_RES;
+    const bool pending_before = kvmv_cfg.vi_detect_state == 1;
     if (kvmv_cfg.reopen_cam_flag.exchange(false) && !kvm_mmf::restart()) return IMG_VENC_ERROR;
     if (width == 0 || height == 0) {
         width = kvmv_cfg.vi_width;
@@ -1446,6 +1450,14 @@ int kvmv_read_img(uint16_t width, uint16_t height, uint8_t type,
     int result = kvm_mmf::acquire(codec, width, height, quality, fps,
                                 __atomic_load_n(&kvmvenc_gop, __ATOMIC_ACQUIRE), &frame);
     if (result < 0) return result;
+
+    const bool error_after = kvmv_cfg.hdmi_res_err == ERROR_RES;
+    const bool pending_after = kvmv_cfg.vi_detect_state == 1;
+    if (error_before || error_after || pending_before || pending_after) {
+        kvm_mmf::release(codec, frame.token);
+        free(frame.data);
+        return error_before || error_after ? -7 : -4;
+    }
 
     // Detect unchanged JPEGs without reading raw VPSS pixels.
     if (codec == kvm_mmf::MJPEG) {
